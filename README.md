@@ -35,7 +35,7 @@ int main(void) {
 }
 ```
 
-Compile and run:
+Compile and run (after including [`jit.h`](/jit.h)):
 
 ```sh
 gcc -O2 -o prog prog.c && ./prog
@@ -45,12 +45,12 @@ gcc -O2 -o prog prog.c && ./prog
 
 #### Lifecycle
 
-| Function | Description |
-|||
-| `jit_init(j, cap)` | Allocate RWX buffer. `cap=0` → 4096 bytes |
-| `jit_free(j)` | Free buffer |
-| `jit_compile(j)` | Patch all labels, flush icache, return `void*` to code |
-| `jit_fn(j)` | Return raw pointer without patching |
+| Function           | Description                                            |
+| ------------------ | ------------------------------------------------------ |
+| `jit_init(j, cap)` | Allocate RWX buffer. `cap=0` → 4096 bytes              |
+| `jit_free(j)`      | Free buffer                                            |
+| `jit_compile(j)`   | Patch all labels, flush icache, return `void*` to code |
+| `jit_fn(j)`        | Return raw pointer without patching                    |
 
 #### Labels & branches
 
@@ -75,17 +75,17 @@ All fixups are resolved when you call `jit_compile()`.
 
 #### Condition codes (`jit_cc`)
 
-| Code | Meaning |
-|||
-| `JIT_CC_EQ` | Equal / zero |
-| `JIT_CC_NE` | Not equal |
-| `JIT_CC_LT` | Signed less than |
-| `JIT_CC_LE` | Signed less or equal |
-| `JIT_CC_GT` | Signed greater than |
-| `JIT_CC_GE` | Signed greater or equal |
-| `JIT_CC_ULT` | Unsigned less than |
-| `JIT_CC_ULE` | Unsigned less or equal |
-| `JIT_CC_UGT` | Unsigned greater than |
+| Code         | Meaning                   |
+| ------------ | ------------------------- |
+| `JIT_CC_EQ`  | Equal / zero              |
+| `JIT_CC_NE`  | Not equal                 |
+| `JIT_CC_LT`  | Signed less than          |
+| `JIT_CC_LE`  | Signed less or equal      |
+| `JIT_CC_GT`  | Signed greater than       |
+| `JIT_CC_GE`  | Signed greater or equal   |
+| `JIT_CC_ULT` | Unsigned less than        |
+| `JIT_CC_ULE` | Unsigned less or equal    |
+| `JIT_CC_UGT` | Unsigned greater than     |
 | `JIT_CC_UGE` | Unsigned greater or equal |
 
 Used by: `jit_jcc_lbl`, `jit_setcc`, `jit_cmov_rr64`.
@@ -308,7 +308,7 @@ jit_epilog_frame(&j);
 ((void(*)(void))jit_compile(&j))();
 ```
 
-### Architecture Detection
+### Testing
 
 `JIT_ARCH` is auto-detected from compiler predefined macros. Override it manually if cross-compiling:
 
@@ -318,8 +318,6 @@ jit_epilog_frame(&j);
 ```
 
 Available values: `JIT_ARCH_X86_32`, `JIT_ARCH_X86_64`, `JIT_ARCH_ARM32`, `JIT_ARCH_ARM64`.
-
-### Testing
 
 ```sh
 gcc -O2 -o test test.c && ./test
