@@ -17,9 +17,8 @@ test.rv64: test.rv64.c jit.h
 	$(QEMU) ./$@
 
 run: test.x86-64
-	./test.x86-64
 
-run-rv64: test.rv64
+run-rv64:
 	$(QEMU) ./test.rv64
 
 clean:

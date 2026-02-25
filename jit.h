@@ -40,6 +40,7 @@ extern "C" {
 #define JIT_ARCH_X86_64 2
 #define JIT_ARCH_ARM32 3
 #define JIT_ARCH_ARM64 4
+#define JIT_ARCH_RV64 5
 
 #if !defined(JIT_ARCH)
 #if defined(__x86_64__) || defined(_M_X64)
@@ -50,6 +51,8 @@ extern "C" {
 #define JIT_ARCH JIT_ARCH_ARM64
 #elif defined(__arm__) || defined(_M_ARM)
 #define JIT_ARCH JIT_ARCH_ARM32
+#elif defined(__riscv) && __riscv_xlen == 64
+#define JIT_ARCH JIT_ARCH_RV64
 #else
 #error "Unsupported architecture"
 #endif
@@ -237,29 +240,6 @@ static int jit_label(jit_buf* j) {
 
 static void jit_bind(jit_buf* j, int lbl) {
   j->labels[lbl] = j->len;
-}
-
-static void jit_patch(jit_buf* j) {
-  int i;
-  for (i = 0; i < j->nfixups; i++) {
-    usz off = j->fixups[i].off;
-    int lbl = j->fixups[i].lbl;
-    int sz = j->fixups[i].sz;
-    usz tgt = j->labels[lbl];
-    if (tgt == (usz)-1)
-      continue;
-    if (sz == 4) {
-      i32 rel = (i32)(tgt - (off + 4));
-      j->buf[off + 0] = (u8)(rel);
-      j->buf[off + 1] = (u8)(rel >> 8);
-      j->buf[off + 2] = (u8)(rel >> 16);
-      j->buf[off + 3] = (u8)(rel >> 24);
-    } else if (sz == 1) {
-      i8 rel = (i8)(tgt - (off + 1));
-      j->buf[off] = (u8)rel;
-    }
-  }
-  j->nfixups = 0;
 }
 
 static void jit_add_fixup(jit_buf* j, usz off, int lbl, int sz) {
@@ -1555,6 +1535,473 @@ static void jit_cdq(jit_buf* j) {
 }
 
 #endif
+
+#if JIT_ARCH == JIT_ARCH_RV64
+
+typedef enum {
+  ZERO = 0,
+  RA = 1,
+  SP = 2,
+  GP = 3,
+  TP = 4,
+  T0 = 5,
+  T1 = 6,
+  T2 = 7,
+  S0 = 8,
+  S1 = 9,
+  A0 = 10,
+  A1 = 11,
+  A2 = 12,
+  A3 = 13,
+  A4 = 14,
+  A5 = 15,
+  A6 = 16,
+  A7 = 17,
+  S2 = 18,
+  S3 = 19,
+  S4 = 20,
+  S5 = 21,
+  S6 = 22,
+  S7 = 23,
+  S8 = 24,
+  S9 = 25,
+  S10 = 26,
+  S11 = 27,
+  T3 = 28,
+  T4 = 29,
+  T5 = 30,
+  T6 = 31,
+  FP = 8
+} jit_reg;
+
+static void rv_emit(jit_buf* j, u32 ins) {
+  jit_ensure(j, 4);
+  j->buf[j->len + 0] = (u8)(ins);
+  j->buf[j->len + 1] = (u8)(ins >> 8);
+  j->buf[j->len + 2] = (u8)(ins >> 16);
+  j->buf[j->len + 3] = (u8)(ins >> 24);
+  j->len += 4;
+}
+
+static u32 rv_r(u32 funct7, int rs2, int rs1, u32 funct3, int rd, u32 opcode) {
+  return (funct7 << 25) | ((u32)(rs2 & 31) << 20) | ((u32)(rs1 & 31) << 15) |
+         (funct3 << 12) | ((u32)(rd & 31) << 7) | opcode;
+}
+
+static u32 rv_i(i32 imm12, int rs1, u32 funct3, int rd, u32 opcode) {
+  return ((u32)(imm12 & 0xFFF) << 20) | ((u32)(rs1 & 31) << 15) |
+         (funct3 << 12) | ((u32)(rd & 31) << 7) | opcode;
+}
+
+static u32 rv_s(i32 imm, int rs2, int rs1, u32 funct3, u32 opcode) {
+  u32 lo = (u32)(imm & 0x1F);
+  u32 hi = (u32)((imm >> 5) & 0x7F);
+  return (hi << 25) | ((u32)(rs2 & 31) << 20) | ((u32)(rs1 & 31) << 15) |
+         (funct3 << 12) | (lo << 7) | opcode;
+}
+
+static u32 rv_b(i32 imm, int rs2, int rs1, u32 funct3, u32 opcode) {
+  u32 b12 = (u32)(imm >> 12) & 1;
+  u32 b11 = (u32)(imm >> 11) & 1;
+  u32 b10_5 = (u32)(imm >> 5) & 0x3F;
+  u32 b4_1 = (u32)(imm >> 1) & 0xF;
+  return (b12 << 31) | (b10_5 << 25) | ((u32)(rs2 & 31) << 20) |
+         ((u32)(rs1 & 31) << 15) | (funct3 << 12) | (b4_1 << 8) | (b11 << 7) |
+         opcode;
+}
+
+static u32 rv_u(i32 imm20, int rd, u32 opcode) {
+  return ((u32)(imm20 & 0xFFFFF) << 12) | ((u32)(rd & 31) << 7) | opcode;
+}
+
+static u32 rv_j(i32 imm, int rd, u32 opcode) {
+  u32 b20 = (u32)(imm >> 20) & 1;
+  u32 b19_12 = (u32)(imm >> 12) & 0xFF;
+  u32 b11 = (u32)(imm >> 11) & 1;
+  u32 b10_1 = (u32)(imm >> 1) & 0x3FF;
+  return (b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12) |
+         ((u32)(rd & 31) << 7) | opcode;
+}
+
+static void jit_mov_rr64(jit_buf* j, int dst, int src) {
+  rv_emit(j, rv_r(0, ZERO, src, 0, dst, 0x33));
+}
+
+static void jit_mov_rr32(jit_buf* j, int dst, int src) {
+  rv_emit(j, rv_r(0, ZERO, src, 0, dst, 0x33));
+  rv_emit(j, rv_i(0, dst, 6, dst, 0x13));
+}
+
+static void jit_mov_ri64(jit_buf* j, int dst, i64 imm) {
+  i32 lo, hi, lo32, lo32_lo, lo32_hi, hi32;
+  if (imm >= -2048 && imm < 2048) {
+    rv_emit(j, rv_i((i32)imm, ZERO, 0, dst, 0x13));
+    return;
+  }
+  lo = (i32)(imm & 0xFFF);
+  if (lo & 0x800)
+    lo -= 0x1000;
+  if (imm >= -2147483648LL && imm <= 2147483647LL) {
+    hi = (i32)((imm - lo) >> 12);
+    rv_emit(j, rv_u(hi, dst, 0x37));
+    if (lo)
+      rv_emit(j, rv_i(lo, dst, 0, dst, 0x13));
+    return;
+  }
+  hi32 = (i32)((u64)imm >> 32);
+  lo32 = (i32)(imm & 0xFFFFFFFF);
+  lo32_lo = lo32 & 0xFFF;
+  if (lo32_lo & 0x800)
+    lo32_lo -= 0x1000;
+  lo32_hi = (i32)((lo32 - lo32_lo) >> 12);
+  jit_mov_ri64(j, dst, (i64)hi32);
+  rv_emit(j, rv_i(32, dst, 1, dst, 0x13));
+  if (lo32_hi)
+    rv_emit(j, rv_u(lo32_hi, T6, 0x37));
+  if (lo32_lo)
+    rv_emit(j, rv_i(lo32_lo, lo32_hi ? T6 : ZERO, 0, T6, 0x13));
+  if (lo32_hi || lo32_lo)
+    rv_emit(j, rv_r(0, T6, dst, 4, dst, 0x33));
+}
+
+static void jit_mov_ri32(jit_buf* j, int dst, i32 imm) {
+  jit_mov_ri64(j, dst, (i64)imm);
+}
+
+static void jit_add_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0, b, a, 0, d, 0x33));
+}
+
+static void jit_sub_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0x20, b, a, 0, d, 0x33));
+}
+
+static void jit_and_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0, b, a, 7, d, 0x33));
+}
+
+static void jit_or_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0, b, a, 6, d, 0x33));
+}
+
+static void jit_xor_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0, b, a, 4, d, 0x33));
+}
+
+static void jit_mul_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(1, b, a, 0, d, 0x33));
+}
+
+static void jit_div_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(1, b, a, 4, d, 0x33));
+}
+
+static void jit_divu_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(1, b, a, 5, d, 0x33));
+}
+
+static void jit_rem_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(1, b, a, 6, d, 0x33));
+}
+
+static void jit_remu_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(1, b, a, 7, d, 0x33));
+}
+
+static void jit_add_rr32(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0, b, a, 0, d, 0x3B));
+}
+
+static void jit_sub_rr32(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0x20, b, a, 0, d, 0x3B));
+}
+
+static void jit_mul_rr32(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(1, b, a, 0, d, 0x3B));
+}
+
+static void jit_div_rr32(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(1, b, a, 4, d, 0x3B));
+}
+
+static void jit_rem_rr32(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(1, b, a, 6, d, 0x3B));
+}
+
+static void jit_add_ri64(jit_buf* j, int d, int s, i32 imm) {
+  rv_emit(j, rv_i(imm, s, 0, d, 0x13));
+}
+
+static void jit_add_ri32(jit_buf* j, int d, int s, i32 imm) {
+  rv_emit(j, rv_i(imm, s, 0, d, 0x1B));
+}
+
+static void jit_and_ri64(jit_buf* j, int d, int s, i32 imm) {
+  rv_emit(j, rv_i(imm, s, 7, d, 0x13));
+}
+
+static void jit_or_ri64(jit_buf* j, int d, int s, i32 imm) {
+  rv_emit(j, rv_i(imm, s, 6, d, 0x13));
+}
+
+static void jit_xor_ri64(jit_buf* j, int d, int s, i32 imm) {
+  rv_emit(j, rv_i(imm, s, 4, d, 0x13));
+}
+
+static void jit_neg_r64(jit_buf* j, int d, int s) {
+  rv_emit(j, rv_r(0x20, s, ZERO, 0, d, 0x33));
+}
+
+static void jit_neg_r32(jit_buf* j, int d, int s) {
+  rv_emit(j, rv_r(0x20, s, ZERO, 0, d, 0x3B));
+}
+
+static void jit_not_r64(jit_buf* j, int d, int s) {
+  rv_emit(j, rv_i(-1, s, 4, d, 0x13));
+}
+
+static void jit_shl_ri64(jit_buf* j, int d, int s, u8 sh) {
+  rv_emit(j, rv_i(sh & 63, s, 1, d, 0x13));
+}
+
+static void jit_shr_ri64(jit_buf* j, int d, int s, u8 sh) {
+  rv_emit(j, rv_i(sh & 63, s, 5, d, 0x13));
+}
+
+static void jit_sar_ri64(jit_buf* j, int d, int s, u8 sh) {
+  rv_emit(j, (0x40000000) | rv_i(sh & 63, s, 5, d, 0x13));
+}
+
+static void jit_shl_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0, b, a, 1, d, 0x33));
+}
+
+static void jit_shr_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0, b, a, 5, d, 0x33));
+}
+
+static void jit_sar_rr64(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0x20, b, a, 5, d, 0x33));
+}
+
+static void jit_shl_ri32(jit_buf* j, int d, int s, u8 sh) {
+  rv_emit(j, rv_i(sh & 31, s, 1, d, 0x1B));
+}
+
+static void jit_shr_ri32(jit_buf* j, int d, int s, u8 sh) {
+  rv_emit(j, rv_i(sh & 31, s, 5, d, 0x1B));
+}
+
+static void jit_sar_ri32(jit_buf* j, int d, int s, u8 sh) {
+  rv_emit(j, (0x40000000) | rv_i(sh & 31, s, 5, d, 0x1B));
+}
+
+static void jit_ld64(jit_buf* j, int dst, int base, i32 off) {
+  rv_emit(j, rv_i(off, base, 3, dst, 0x03));
+}
+
+static void jit_ld32(jit_buf* j, int dst, int base, i32 off) {
+  rv_emit(j, rv_i(off, base, 2, dst, 0x03));
+}
+
+static void jit_ld32u(jit_buf* j, int dst, int base, i32 off) {
+  rv_emit(j, rv_i(off, base, 6, dst, 0x03));
+}
+
+static void jit_ld16(jit_buf* j, int dst, int base, i32 off) {
+  rv_emit(j, rv_i(off, base, 1, dst, 0x03));
+}
+
+static void jit_ld16u(jit_buf* j, int dst, int base, i32 off) {
+  rv_emit(j, rv_i(off, base, 5, dst, 0x03));
+}
+
+static void jit_ld8(jit_buf* j, int dst, int base, i32 off) {
+  rv_emit(j, rv_i(off, base, 0, dst, 0x03));
+}
+
+static void jit_ld8u(jit_buf* j, int dst, int base, i32 off) {
+  rv_emit(j, rv_i(off, base, 4, dst, 0x03));
+}
+
+static void jit_sd64(jit_buf* j, int src, int base, i32 off) {
+  rv_emit(j, rv_s(off, src, base, 3, 0x23));
+}
+
+static void jit_sd32(jit_buf* j, int src, int base, i32 off) {
+  rv_emit(j, rv_s(off, src, base, 2, 0x23));
+}
+
+static void jit_sd16(jit_buf* j, int src, int base, i32 off) {
+  rv_emit(j, rv_s(off, src, base, 1, 0x23));
+}
+
+static void jit_sd8(jit_buf* j, int src, int base, i32 off) {
+  rv_emit(j, rv_s(off, src, base, 0, 0x23));
+}
+
+static void jit_slt_rr(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0, b, a, 2, d, 0x33));
+}
+
+static void jit_sltu_rr(jit_buf* j, int d, int a, int b) {
+  rv_emit(j, rv_r(0, b, a, 3, d, 0x33));
+}
+
+static void jit_slt_ri(jit_buf* j, int d, int s, i32 i) {
+  rv_emit(j, rv_i(i, s, 2, d, 0x13));
+}
+
+static void jit_sltu_ri(jit_buf* j, int d, int s, i32 i) {
+  rv_emit(j, rv_i(i, s, 3, d, 0x13));
+}
+
+static void jit_seqz(jit_buf* j, int d, int s) {
+  rv_emit(j, rv_i(1, s, 3, d, 0x13));
+}
+
+static void jit_snez(jit_buf* j, int d, int s) {
+  rv_emit(j, rv_r(0, s, ZERO, 3, d, 0x33));
+}
+
+static void jit_sltz(jit_buf* j, int d, int s) {
+  rv_emit(j, rv_r(0, ZERO, s, 2, d, 0x33));
+}
+
+static void jit_sgtz(jit_buf* j, int d, int s) {
+  rv_emit(j, rv_r(0, s, ZERO, 2, d, 0x33));
+}
+
+static void jit_cmp_rr64(jit_buf* j, int a, int b) {
+  (void)j;
+  (void)a;
+  (void)b;
+}
+
+static void jit_cmp_ri64(jit_buf* j, int a, i32 b) {
+  (void)j;
+  (void)a;
+  (void)b;
+}
+
+static void jit_jcc_lbl(jit_buf* j, jit_cc cc, int rs1, int rs2, int lbl) {
+  static const u32 funct3[] = {0, 1, 4, 5, 4, 5, 6, 7, 6, 7};
+  static const int swap[] = {0, 0, 0, 1, 1, 0, 0, 1, 1, 0};
+  u32 fn3 = funct3[cc];
+  int r1 = swap[cc] ? rs2 : rs1;
+  int r2 = swap[cc] ? rs1 : rs2;
+  jit_add_fixup(j, j->len, lbl, 4);
+  rv_emit(j, rv_b(0, r2, r1, fn3, 0x63));
+}
+
+static void jit_jmp_lbl(jit_buf* j, int lbl) {
+  jit_add_fixup(j, j->len, lbl, 4);
+  rv_emit(j, rv_j(0, ZERO, 0x6F));
+}
+
+static void jit_jmp_r64(jit_buf* j, int r) {
+  rv_emit(j, rv_i(0, r, 0, ZERO, 0x67));
+}
+
+static void jit_call_abs(jit_buf* j, int tmp, void* fn) {
+  jit_mov_ri64(j, tmp, (i64)(uintptr_t)fn);
+  rv_emit(j, rv_i(0, tmp, 0, RA, 0x67));
+}
+
+static void jit_ret(jit_buf* j) {
+  rv_emit(j, rv_i(0, RA, 0, ZERO, 0x67));
+}
+
+static void jit_nop(jit_buf* j) {
+  rv_emit(j, 0x00000013);
+}
+
+static void jit_prolog(jit_buf* j) {
+  rv_emit(j, rv_i(-16, SP, 0, SP, 0x13));
+  rv_emit(j, rv_s(8, RA, SP, 3, 0x23));
+  rv_emit(j, rv_s(0, FP, SP, 3, 0x23));
+  rv_emit(j, rv_i(16, SP, 0, FP, 0x13));
+}
+
+static void jit_epilog(jit_buf* j) {
+  rv_emit(j, rv_i(8, SP, 3, RA, 0x03));
+  rv_emit(j, rv_i(0, SP, 3, FP, 0x03));
+  rv_emit(j, rv_i(16, SP, 0, SP, 0x13));
+  jit_ret(j);
+}
+
+static void jit_prolog_frame(jit_buf* j, i32 fsz) {
+  i32 total = 16 + ((fsz + 15) & ~15);
+  rv_emit(j, rv_i(-total, SP, 0, SP, 0x13));
+  rv_emit(j, rv_s(total - 8, RA, SP, 3, 0x23));
+  rv_emit(j, rv_s(total - 16, FP, SP, 3, 0x23));
+  rv_emit(j, rv_i(total, SP, 0, FP, 0x13));
+}
+
+static void jit_epilog_frame(jit_buf* j) {
+  rv_emit(j, rv_r(0, ZERO, FP, 0, SP, 0x33));
+  rv_emit(j, rv_i(-8, FP, 3, RA, 0x03));
+  rv_emit(j, rv_i(-16, FP, 3, FP, 0x03));
+  jit_ret(j);
+}
+
+#define jit_add32 jit_add_rr32
+#define jit_add64 jit_add_rr64
+#define jit_sub32 jit_sub_rr32
+#define jit_sub64 jit_sub_rr64
+#define jit_mul32 jit_mul_rr32
+#define jit_mul64 jit_mul_rr64
+
+static void rv_patch_b(jit_buf* j, usz off, i32 rel) {
+  u32 ins = rv_b(rel, 0, 0, 0, 0);
+  u32 old;
+  memcpy(&old, j->buf + off, 4);
+  ins |= old & 0x01FFF07F;
+  memcpy(j->buf + off, &ins, 4);
+}
+
+static void rv_patch_j(jit_buf* j, usz off, i32 rel) {
+  u32 ins = rv_j(rel, 0, 0);
+  u32 old;
+  memcpy(&old, j->buf + off, 4);
+  ins |= old & 0x00000FFF;
+  memcpy(j->buf + off, &ins, 4);
+}
+
+#endif
+
+static void jit_patch(jit_buf* j) {
+  int i;
+  for (i = 0; i < j->nfixups; i++) {
+    usz off = j->fixups[i].off;
+    int lbl = j->fixups[i].lbl;
+    usz tgt = j->labels[lbl];
+    i32 rel;
+    u32 ins;
+    if (tgt == (usz)-1)
+      continue;
+    rel = (i32)(tgt - off);
+#if JIT_ARCH == JIT_ARCH_RV64
+    memcpy(&ins, j->buf + off, 4);
+    if ((ins & 0x7F) == 0x63) {
+      rv_patch_b(j, off, rel);
+    } else {
+      rv_patch_j(j, off, rel);
+    }
+#else
+    if (j->fixups[i].sz == 4) {
+      i32 pcrel = rel - 4;
+      j->buf[off + 0] = (u8)(pcrel);
+      j->buf[off + 1] = (u8)(pcrel >> 8);
+      j->buf[off + 2] = (u8)(pcrel >> 16);
+      j->buf[off + 3] = (u8)(pcrel >> 24);
+    } else if (j->fixups[i].sz == 1) {
+      j->buf[off] = (u8)(i8)(rel - 1);
+    }
+#endif
+  }
+  j->nfixups = 0;
+}
 
 static void* jit_compile(jit_buf* j) {
   jit_patch(j);
