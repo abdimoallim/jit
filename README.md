@@ -4,7 +4,7 @@ A header-only, cross-platform JIT compiler library in C. Targets x86-32, x86-64,
 
 ### Features
 
-- Targets x86-32, x86-64, ARM32, ARM64 (auto-detected or set `JIT_ARCH`)
+- Targets x86-32, x86-64, ARM32, ARM64, RISC-V 64 (auto-detected or set `JIT_ARCH`)
 - Works on Windows, Linux, macOS and any POSIX system
 - Works with any C89+ compiler (GCC, Clang, MSVC, TCC, etc)
 - Full instruction set: arithmetic, logic, shifts, memory, branches, calls, stack frames
@@ -229,17 +229,164 @@ jit_tzcnt_r32(j, dst, src)
 jit_nop(j)
 ```
 
-#### x86-32 details
+### x86-32 details
 
 Same patterns as x86-64 but without `REX` prefixes and only 8 registers (`EAX`–`EDI`). The `_64` suffix functions are not available. Calling convention on Linux is `cdecl` (args on stack), on Windows `stdcall` or `cdecl` depending on target.
 
-#### ARM64 details
+### ARM64 details
 
 Instructions use a 3-operand form: `jit_add_rr64(j, dst, a, b)`. Registers are `X0`–`X30`, `XZR`/`SP`. `jit_prolog` saves `FP`/`LR` and sets up the frame pointer. Call external functions with `jit_bl_abs(j, tmp_reg, fn_ptr)`.
 
-#### ARM32 details
+### ARM32 details
 
 Same 3-operand form. Registers `R0`–`R15` with aliases `SP=13`, `LR=14`, `PC=15`. `jit_prolog` saves `FP`/`LR` via `PUSH`. Call externals with `jit_bl_abs(j, tmp_reg, fn_ptr)`.
+
+### RISC-V 64 details
+
+RV64GC (base integer + M extension for mul/div). Instructions use a 3-operand form: `jit_add_rr64(j, dst, a, b)`.
+
+#### Register enum
+
+```
+ZERO  RA    SP    GP    TP
+T0–T2       (temporaries)
+S0/FP S1    (saved / frame pointer)
+A0–A7       (args / return values: A0=return)
+S2–S11      (saved)
+T3–T6       (temporaries)
+```
+
+#### Arithmetic & logic
+
+```c
+jit_add_rr64(j, d, a, b)     jit_add_ri64(j, d, s, imm12)
+jit_sub_rr64(j, d, a, b)
+jit_mul_rr64(j, d, a, b)
+jit_div_rr64(j, d, a, b)     // signed (requires M ext)
+jit_divu_rr64(j, d, a, b)    // unsigned
+jit_rem_rr64(j, d, a, b)     // signed remainder
+jit_remu_rr64(j, d, a, b)    // unsigned remainder
+jit_neg_r64(j, d, s)
+jit_not_r64(j, d, s)
+jit_and_rr64(j, d, a, b)     jit_and_ri64(j, d, s, imm12)
+jit_or_rr64(j, d, a, b)      jit_or_ri64(j, d, s, imm12)
+jit_xor_rr64(j, d, a, b)     jit_xor_ri64(j, d, s, imm12)
+jit_shl_ri64(j, d, s, sh)    jit_shl_rr64(j, d, a, b)
+jit_shr_ri64(j, d, s, sh)    jit_shr_rr64(j, d, a, b)   // logical
+jit_sar_ri64(j, d, s, sh)    jit_sar_rr64(j, d, a, b)   // arithmetic
+```
+
+#### Word (32-bit) ops
+
+```c
+jit_add_rr32(j, d, a, b)     // ADDW - sign-extends to 64-bit
+jit_sub_rr32(j, d, a, b)     // SUBW
+jit_mul_rr32(j, d, a, b)     // MULW
+jit_div_rr32(j, d, a, b)     // DIVW
+jit_rem_rr32(j, d, a, b)     // REMW
+jit_shl_ri32(j, d, s, sh)    // SLLIW
+jit_shr_ri32(j, d, s, sh)    // SRLIW
+jit_sar_ri32(j, d, s, sh)    // SRAIW
+```
+
+#### Memory
+
+```c
+jit_ld64(j, dst, base, off)    // LD  — load 64-bit
+jit_ld32(j, dst, base, off)    // LW  — sign-extend
+jit_ld32u(j, dst, base, off)   // LWU — zero-extend
+jit_ld16(j, dst, base, off)    // LH
+jit_ld16u(j, dst, base, off)   // LHU
+jit_ld8(j, dst, base, off)     // LB
+jit_ld8u(j, dst, base, off)    // LBU
+jit_sd64(j, src, base, off)    // SD
+jit_sd32(j, src, base, off)    // SW
+jit_sd16(j, src, base, off)    // SH
+jit_sd8(j, src, base, off)     // SB
+```
+
+#### Compare & set
+
+```c
+jit_slt_rr(j, d, a, b)          // d = (a < b) signed
+jit_sltu_rr(j, d, a, b)         // d = (a < b) unsigned
+jit_slt_ri(j, d, s, imm12)
+jit_sltu_ri(j, d, s, imm12)
+jit_seqz(j, d, s)               // d = (s == 0)
+jit_snez(j, d, s)               // d = (s != 0)
+jit_sltz(j, d, s)               // d = (s < 0)
+jit_sgtz(j, d, s)               // d = (s > 0)
+```
+
+#### Branches
+
+On RV64, `jit_jcc_lbl` takes **two source registers** to compare directly (no prior `cmp`):
+
+```c
+jit_jcc_lbl(j, cc, rs1, rs2, lbl)
+```
+
+```c
+jit_jcc_lbl(&j, JIT_CC_EQ, A0, A1, lbl)  // branch if A0 == A1
+jit_jcc_lbl(&j, JIT_CC_LT, A0, ZERO, lbl) // branch if A0 < 0
+jit_jmp_lbl(&j, lbl)
+jit_jmp_r64(&j, r)                         // jalr zero, 0(r)
+jit_call_abs(&j, T0, fn_ptr)               // load address into T0, jalr ra, 0(T0)
+```
+
+#### Stack & frames
+
+```c
+jit_prolog(j)            // addi sp,-16; sd ra,8(sp); sd fp,0(sp); addi fp,sp,16
+jit_epilog(j)            // ld ra,8(sp); ld fp,0(sp); addi sp,16; ret
+jit_prolog_frame(j, n)   // same but allocates n extra bytes (16-byte aligned)
+jit_epilog_frame(j)      // same as epilog
+```
+
+## Building & testing
+
+```sh
+# native x86-64
+make test
+
+# RISC-V 64 via QEMU (requires riscv64-linux-gnu-gcc and qemu-riscv64)
+make test-rv64
+
+# all targets
+make
+```
+
+Install the RV64 toolchain on Debian/Ubuntu:
+
+```sh
+sudo apt install gcc-riscv64-linux-gnu qemu-user-static
+```
+
+Then:
+
+```sh
+# x86-64 native
+gcc -O2 -o test.x86-64 test.x86-64.c && ./test.x86-64
+
+# RISC-V 64 (requires riscv64-linux-gnu-gcc + qemu-riscv64)
+riscv64-linux-gnu-gcc -O2 -static -o test.rv64 test.rv64.c
+qemu-riscv64 ./test.rv64
+```
+
+If QEMU can't find the libc for the binary, you may also need `libc6-riscv64-cross`, but the `-static` flag should make that a non-issue.
+
+`JIT_ARCH` is auto-detected from compiler predefined macros. Override it manually if cross-compiling:
+
+```c
+#define JIT_ARCH JIT_ARCH_ARM64
+#include "jit.h"
+```
+
+Available values: `JIT_ARCH_X86_32`, `JIT_ARCH_X86_64`, `JIT_ARCH_ARM32`, `JIT_ARCH_ARM64`, `JIT_ARCH_RV64`.
+
+The [x86-64](/test.x86-64.c) test suite covers: constants, arithmetic (add/sub/mul/div), bitwise ops, shifts, negation, sign extension, branches, loops, stack frames, local variables, C function calls, conditional moves, setcc, LEA, bswap, popcnt, buffer grow, factorial, fibonacci and multi-label dispatch.
+
+The [RV64](/test.rv64.c) suite covers: constants (including large 48-bit), all ALU ops (add/sub/mul/div/rem), bitwise, shifts (imm/reg), slt/sltu, branches (eq/ne/lt/le/gt/ge), loops, stack locals, memory load/store, immediate arithmetic, C function calls, multi-label dispatch, W (32-bit) ops and buffer grow.
 
 ### Examples
 
@@ -307,23 +454,6 @@ jit_mov_ri64(&j, RAX, 0);
 jit_epilog_frame(&j);
 ((void(*)(void))jit_compile(&j))();
 ```
-
-### Testing
-
-`JIT_ARCH` is auto-detected from compiler predefined macros. Override it manually if cross-compiling:
-
-```c
-#define JIT_ARCH JIT_ARCH_ARM64
-#include "jit.h"
-```
-
-Available values: `JIT_ARCH_X86_32`, `JIT_ARCH_X86_64`, `JIT_ARCH_ARM32`, `JIT_ARCH_ARM64`.
-
-```sh
-gcc -O2 -o test test.c && ./test
-```
-
-The test suite covers: constants, arithmetic (add/sub/mul/div), bitwise ops, shifts, negation, sign extension, branches, loops, stack frames, local variables, C function calls, conditional moves, setcc, LEA, bswap, popcnt, buffer grow, factorial, fibonacci and multi-label dispatch.
 
 ### License
 
