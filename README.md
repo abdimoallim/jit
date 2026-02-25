@@ -1,6 +1,6 @@
 ### jit
 
-A header-only, cross-platform JIT compiler library in C. Targets x86-32, x86-64, ARM32 and ARM64.
+A header-only, cross-platform JIT compiler library in C. Targets x86-32, x86-64, ARM32, ARM64, RISC-V 64.
 
 ### Features
 
