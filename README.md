@@ -343,7 +343,7 @@ jit_prolog_frame(j, n)   // same but allocates n extra bytes (16-byte aligned)
 jit_epilog_frame(j)      // same as epilog
 ```
 
-## Building & testing
+### Building & testing
 
 ```sh
 # native x86-64
@@ -454,6 +454,12 @@ jit_mov_ri64(&j, RAX, 0);
 jit_epilog_frame(&j);
 ((void(*)(void))jit_compile(&j))();
 ```
+
+### Missing features
+
+- [ ] Encode more JIT intrinsics/ops, e.g. vectorization
+- [ ] Additional architectures (ppc, loongarch, MIPS, SPARC, etc)
+- [ ] Heuristics for multithreaded JIT, probably not necessary
 
 ### License
 
